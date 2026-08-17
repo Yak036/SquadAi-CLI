@@ -1,0 +1,29 @@
+{
+  "name": "squadai-cli",
+  "version": "1.0.0",
+  "type": "module",
+  "bin": {
+    "squad": "./dist/index.js"
+  },
+  "scripts": {
+    "dev": "tsc && node dist/index.js",
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "check": "tsc && node dist/selfcheck.js"
+  },
+  "license": "ISC",
+  "description": "TUI tipo OpenCode que habla con SquadAi-Back",
+  "dependencies": {
+    "chalk": "^5.6.2",
+    "dotenv": "^17.4.2",
+    "ink": "^6.8.0",
+    "ink-text-input": "^6.0.0",
+    "ora": "^9.0.0",
+    "react": "^19.2.8"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "@types/react": "^19.2.18",
+    "typescript": "^5.9.0"
+  }
+}

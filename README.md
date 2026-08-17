@@ -1,12 +1,12 @@
-# SquadAi-CLI impresionante
+# SquadAi-CLI impresionante asdasd  asdasdasdasdasdasdasdasdasdasdasdasdasdasdasdasdadasdasdasdsaas
 
 REPL tipo OpenCode / Claude Code. Es el front del orquestador: hablas en la terminal y el CLI pega a **SquadAi-Back**.
 
 ```text
   tú
    |
-   v
-  squad  ❯ crea un login
+   v          
+  squad  ❯ crea un login 
   /workspace  /connect  /help
    |
    | HTTP
@@ -45,7 +45,7 @@ npm start -- ./mi-proyecto -p "añade un README"
 
 Flags: `-a/--api` (default `http://localhost:4000`), `-p/--prompt`, `-h`, `-v`. Override: `SQUAD_API_URL`.
 
-## Comandos
+## Comandos 
 
 | Comando | Qué hace |
 |---|---|
@@ -82,3 +82,11 @@ src/
 ```
 
 `npm run check` corre el selfcheck (parser, sin red).
+
+## Changelog
+
+`squad -v` imprime la versión de este paquete. El historial del producto está en [CHANGELOG.md](./CHANGELOG.md).
+
+---
+
+> Línea de prueba: edición desde el chat ✅

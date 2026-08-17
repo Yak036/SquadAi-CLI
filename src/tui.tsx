@@ -7,7 +7,7 @@ import path from "node:path";
 import fs from "node:fs/promises";
 import { Box, Text, render, useApp, useInput, useStdin, useStdout } from "ink";
 import TextInput from "ink-text-input";
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import type { SquadApi } from "./api.js";
 import { ContextManager, formatContextForPrompt } from "./context.js";
 import {
@@ -20,6 +20,7 @@ import {
   type Session,
 } from "./commands.js";
 import { findAtRefs } from "./parse.js";
+import { PromptBar } from "./prompt-bar.js";
 import {
   backspace,
   clickAt,
@@ -39,14 +40,16 @@ import {
   move,
   newline,
   ordered,
-  parseMouse,
   pasteText,
+  peelInput,
   redo,
   scrollToCursor,
   serialize,
   textToCopy,
+  typeInto,
   undo,
   type Doc,
+  type MouseEv,
   type Pos,
 } from "./buffer.js";
 import {
@@ -62,7 +65,9 @@ import {
   type TreeEntry,
 } from "./midnight.js";
 import { nextUiMode, parseUiMode, parseSlash, type UiMode } from "./parse.js";
-import { isWriteTrace, lineDiff, readOrNull, relFromTrace, revertFile, sleep, type PendingChange } from "./review.js";
+import { actionTitle, isWriteTrace, readOrNull, relFromTrace, revertFile, reviewDiff, sleep, type PendingChange } from "./review.js";
+import { DiffView } from "./diffview.js";
+import { colorizeLine, langFromExt } from "./syntax.js";
 import type { OrchestrateRequest, TraceActor, TraceEvent } from "./types.js";
 
 type Line = { kind: "user" | "squad" | "sys"; text: string; who?: string };
@@ -91,20 +96,42 @@ function useTermSize(): { columns: number; rows: number } {
 
 function useSpinner(on: boolean): string {
   const [i, setI] = useState(0);
+  const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
   useEffect(() => {
-    if (!on) return;
-    const t = setInterval(() => setI((n) => n + 1), 80);
-    return () => clearInterval(t);
+    if (!on) {
+      if (intervalRef.current) {
+        clearInterval(intervalRef.current);
+        intervalRef.current = null;
+      }
+      setI(0);
+      return;
+    }
+    intervalRef.current = setInterval(() => setI((n) => n + 1), 80);
+    return () => {
+      if (intervalRef.current) {
+        clearInterval(intervalRef.current);
+        intervalRef.current = null;
+      }
+    };
   }, [on]);
+
   return on ? (SPIN[i % SPIN.length] ?? "⠋") : "·";
 }
 
-function useClock(): string {
+function useClock(intervalMs = 2000): string {
   const [now, setNow] = useState(() => new Date().toTimeString().slice(0, 8));
+  const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
   useEffect(() => {
-    const t = setInterval(() => setNow(new Date().toTimeString().slice(0, 8)), 1000);
-    return () => clearInterval(t);
-  }, []);
+    intervalRef.current = setInterval(() => {
+      setNow(new Date().toTimeString().slice(0, 8));
+    }, intervalMs);
+    return () => {
+      if (intervalRef.current) clearInterval(intervalRef.current);
+    };
+  }, [intervalMs]);
+
   return now;
 }
 
@@ -180,7 +207,7 @@ function App(props: { api: SquadApi; session: Session; version: string }): React
   const clock = useClock();
   const [lines, setLines] = useState<Line[]>([]);
   const [steps, setSteps] = useState<Step[]>([]);
-  const [value, setValue] = useState("");
+  const [promptTick, setPromptTick] = useState(0);
   const [busy, setBusy] = useState(false);
   const [quitAsk, setQuitAsk] = useState(false);
   const [connectMode, setConnectMode] = useState(false);
@@ -205,9 +232,14 @@ function App(props: { api: SquadApi; session: Session; version: string }): React
   const dragRef = useRef(false);
   const openRelRef = useRef<string | null>(null);
   const dirtyRef = useRef(false);
+  const docRef = useRef<Doc | null>(null);
+  const anchorRef = useRef<Pos | null>(null);
+  const draftRef = useRef("");
   const beforeRef = useRef<Map<string, string | null>>(new Map());
   openRelRef.current = openRel;
   dirtyRef.current = Boolean(doc?.dirty);
+  docRef.current = doc;
+  anchorRef.current = anchor;
   const spin = useSpinner(busy);
 
   const push = (line: Line): void => {
@@ -238,12 +270,15 @@ function App(props: { api: SquadApi; session: Session; version: string }): React
   }, [tree]);
 
   useEffect(() => {
+    const sysIntervalRef = { current: null as ReturnType<typeof setInterval> | null };
     const tick = (): void => {
       void readSys().then(setSys);
     };
     tick();
-    const t = setInterval(tick, 1000);
-    return () => clearInterval(t);
+    sysIntervalRef.current = setInterval(tick, 2000);
+    return () => {
+      if (sysIntervalRef.current) clearInterval(sysIntervalRef.current);
+    };
   }, []);
 
   const explorerW = Math.max(18, Math.min(26, Math.floor(columns * 0.22)));
@@ -253,30 +288,48 @@ function App(props: { api: SquadApi; session: Session; version: string }): React
   const treeVis = Math.max(4, rows - 12);
   const treeStart =
     tree.length <= treeVis ? 0 : Math.max(0, Math.min(cursor - treeVis + 1, tree.length - treeVis));
+  const reviewing = pending[reviewIdx] ?? null;
+  const splitRows = reviewing ? reviewDiff(reviewing.before, reviewing.after) : [];
+  const split = uiMode !== "editor" && Boolean(openRel);
+  const fileVis = reviewing
+    ? Math.max(8, rows - 18)
+    : split
+      ? Math.max(5, Math.floor((rows - 14) / 2))
+      : codeVis;
+  const diffMaxOff = Math.max(0, splitRows.length - 1);
+
+  const scrollDiff = (delta: number): void => {
+    setPreviewOff((o) => Math.max(0, Math.min(diffMaxOff, o + delta)));
+  };
 
   useEffect(() => {
-    if (away || uiMode !== "editor") {
+    if (away) {
       process.stdout.write(MOUSE_OFF);
       return;
     }
+    // Habilitar mouse events en editor Y en chat/squad (para click en prompt)
     process.stdout.write(MOUSE_ON);
     return () => {
       process.stdout.write(MOUSE_OFF);
     };
-  }, [uiMode, away]);
+  }, [uiMode, away, reviewing]);
 
   useEffect(() => {
-    if (!doc) return;
+    if (!doc || reviewing) return;
     setPreviewOff((off) => scrollToCursor(doc.row, off, codeVis));
-  }, [doc?.row, codeVis]);
+  }, [doc?.row, codeVis, reviewing]);
 
   const persistIfDirty = async (): Promise<boolean> => {
-    if (!openRel || !doc?.dirty) return true;
+    const current = docRef.current;
+    if (!openRel || !current?.dirty) return true;
     const abs = path.resolve(session.workspaceDir, openRel);
     if (!insideWorkspace(session.workspaceDir, abs)) return false;
     try {
-      await fs.writeFile(abs, serialize(doc), "utf8");
-      setDoc(markSaved(doc));
+      await fs.writeFile(abs, serialize(current), "utf8");
+      setDoc((prev) => {
+        if (!prev || prev.tick !== current.tick) return prev;
+        return markSaved(prev);
+      });
       return true;
     } catch (err) {
       push({ kind: "sys", text: err instanceof Error ? err.message : String(err) });
@@ -481,11 +534,11 @@ function App(props: { api: SquadApi; session: Session; version: string }): React
     }
   };
 
-  const onMouse = (raw: string): boolean => {
-    const ev = parseMouse(raw);
-    if (!ev || uiMode !== "editor") return false;
+  const applyMouse = (ev: MouseEv): void => {
+    if (uiMode !== "editor" && !reviewing) return;
     const kind = mouseKind(ev);
-    if (kind === "ignore") return true;
+    if (kind === "ignore") return;
+    const current = docRef.current;
     const hit = hitTest(ev.x, ev.y, {
       explorerW,
       centerW,
@@ -498,101 +551,114 @@ function App(props: { api: SquadApi; session: Session; version: string }): React
     if (kind === "wheel-up" || kind === "wheel-down") {
       dragRef.current = false;
       const delta = kind === "wheel-up" ? -3 : 3;
+      if (reviewing) {
+        scrollDiff(delta);
+        return;
+      }
       if (hit.zone === "tree") {
         setFocus("tree");
         setCursor((n) => Math.max(0, Math.min(tree.length - 1, n + delta)));
-      } else if (hit.zone === "code" && doc) {
-        const maxOff = Math.max(0, doc.lines.length - 1);
+      } else if (hit.zone === "code" && current) {
+        const maxOff = Math.max(0, current.lines.length - 1);
         setPreviewOff((o) => Math.max(0, Math.min(maxOff, o + delta)));
       }
-      return true;
+      return;
     }
     if (kind === "up") {
       dragRef.current = false;
-      return true;
+      return;
     }
-    // Arrastre: ancla fija, el cursor sigue al ratón → se sombrea.
     if (kind === "drag") {
-      if (!dragRef.current || !doc) return true;
-      const row = hit.zone === "code" ? hit.row : doc.row;
-      const col = hit.zone === "code" ? hit.col : doc.col;
-      setDoc(clickAt(doc, row, col));
-      return true;
+      if (!dragRef.current) return;
+      const row = hit.zone === "code" ? hit.row : (current?.row ?? 0);
+      const col = hit.zone === "code" ? hit.col : (current?.col ?? 0);
+      setDoc((prev) => (prev ? clickAt(prev, row, col) : prev));
+      return;
     }
     if (kind === "down" && hit.zone === "tree") {
       dragRef.current = false;
       openAt(hit.index);
-      return true;
+      return;
     }
     if (kind === "down" && hit.zone === "code") {
       dragRef.current = true;
       setFocus("buf");
-      if (!doc) return true;
+      if (!current) return;
       if (mouseShift(ev)) {
-        if (!anchor) setAnchor({ row: doc.row, col: doc.col });
+        if (!anchorRef.current) setAnchor({ row: current.row, col: current.col });
       } else {
         setAnchor({ row: hit.row, col: hit.col });
       }
-      setDoc(clickAt(doc, hit.row, hit.col));
-      return true;
+      setDoc((prev) => (prev ? clickAt(prev, hit.row, hit.col) : prev));
     }
-    return true;
+  };
+
+  const eatSelPrev = (prev: Doc): Doc => {
+    const sel = anchorRef.current;
+    const cur: Pos = { row: prev.row, col: prev.col };
+    if (!sel || cmpPos(sel, cur) === 0) return prev;
+    anchorRef.current = null;
+    setAnchor(null);
+    return deleteRange(prev, sel, cur);
   };
 
   useInput(
     (input, key) => {
       if (away) return;
-      if (/\[</.test(input) || input.includes("\x1b[<")) {
-        onMouse(input);
+      const peeled = peelInput(input);
+      for (const ev of peeled.events) applyMouse(ev);
+      const text = peeled.text;
+      if (peeled.events.length && !text && !key.backspace && !key.delete && !key.return && !key.tab && !key.ctrl) {
         return;
       }
-      if (onMouse(input)) return;
       if (quitAsk) {
-        if (input === "s" || input === "y" || key.return) leave();
-        else if (input === "n" || key.escape) setQuitAsk(false);
+        if (text === "s" || text === "y" || input === "s" || input === "y" || key.return) leave();
+        else if (text === "n" || input === "n" || key.escape) setQuitAsk(false);
         else if (key.ctrl && input === "c") leave();
         return;
       }
       if (pending.length && !key.ctrl) {
-        if (input === "y") {
+        if (text === "y" || input === "y") {
           acceptCurrent();
           return;
         }
-        if (input === "n") {
+        if (text === "n" || input === "n") {
           void rejectCurrent();
           return;
         }
-        if (input === "a") {
+        if (text === "a" || input === "a") {
           acceptAll();
           return;
         }
-        if (input === "r") {
+        if (text === "r" || input === "r") {
           void rejectAll();
+          return;
+        }
+        if (key.downArrow || text === "j" || input === "j" || key.pageDown) {
+          scrollDiff(key.pageDown ? fileVis : 1);
+          return;
+        }
+        if (key.upArrow || text === "k" || input === "k" || key.pageUp) {
+          scrollDiff(key.pageUp ? -fileVis : -1);
           return;
         }
       }
 
-      const editing = uiMode === "editor" && focus === "buf" && doc;
+      const editing = uiMode === "editor" && focus === "buf" && Boolean(docRef.current);
 
       if (editing && key.ctrl && input === "c") {
         if (busy) {
           cancelJob();
           return;
         }
-        copyText(textToCopy(doc, anchor));
+        const current = docRef.current;
+        if (current) copyText(textToCopy(current, anchorRef.current));
         return;
       }
       if (editing && key.ctrl && (input === "p" || input === "v")) {
-        void pasteText().then((text) => {
-          if (!text) return;
-          setDoc((prev) => {
-            if (!prev) return prev;
-            const cur: Pos = { row: prev.row, col: prev.col };
-            const base =
-              anchor && cmpPos(anchor, cur) !== 0 ? deleteRange(prev, anchor, cur) : prev;
-            setAnchor(null);
-            return insert(base, text);
-          });
+        void pasteText().then((pasted) => {
+          if (!pasted) return;
+          setDoc((prev) => (prev ? insert(eatSelPrev(prev), pasted) : prev));
         });
         return;
       }
@@ -625,15 +691,15 @@ function App(props: { api: SquadApi; session: Session; version: string }): React
         return;
       }
 
-      if (focus === "buf" && doc) {
+      if (focus === "buf" && docRef.current) {
         if (key.ctrl && (input === "y" || (input === "z" && key.shift))) {
           setAnchor(null);
-          setDoc(redo(doc));
+          setDoc((prev) => (prev ? redo(prev) : prev));
           return;
         }
         if (key.ctrl && input === "z") {
           setAnchor(null);
-          setDoc(undo(doc));
+          setDoc((prev) => (prev ? undo(prev) : prev));
           return;
         }
         if (key.escape) {
@@ -641,39 +707,39 @@ function App(props: { api: SquadApi; session: Session; version: string }): React
           setAnchor(null);
           return;
         }
-        const eatSel = (): Doc => {
-          if (!anchor || cmpPos(anchor, { row: doc.row, col: doc.col }) === 0) return doc;
-          setAnchor(null);
-          return deleteRange(doc, anchor, { row: doc.row, col: doc.col });
-        };
         if (key.tab) {
-          setDoc(insert(eatSel(), "  "));
+          setDoc((prev) => (prev ? insert(eatSelPrev(prev), "  ") : prev));
           return;
         }
         if (key.return) {
-          setDoc(newline(eatSel()));
+          setDoc((prev) => (prev ? newline(eatSelPrev(prev)) : prev));
           return;
         }
-        // Linux manda Backspace como 0x7f; Ink lo etiqueta `delete` (el de adelante es CSI 3~ / ctrl+d).
+        // Linux: 0x7f llega como key.delete. Si el chunk trae más letras, typeInto las aplica en orden.
         if (key.backspace || key.delete) {
-          if (anchor && cmpPos(anchor, { row: doc.row, col: doc.col }) !== 0) {
-            setDoc(eatSel());
-            return;
-          }
-          setDoc(backspace(doc));
+          setDoc((prev) => {
+            if (!prev) return prev;
+            let d = eatSelPrev(prev);
+            d = backspace(d);
+            const extra = text.replace(/\x7f/g, "").replace(/\x08/g, "");
+            return extra ? typeInto(d, extra) : d;
+          });
           return;
         }
         if (key.ctrl && input === "d") {
-          setDoc(delChar(doc));
+          setDoc((prev) => (prev ? delChar(prev) : prev));
           return;
         }
         const arrow =
           key.leftArrow ? "l" : key.rightArrow ? "r" : key.upArrow ? "u" : key.downArrow ? "d" : key.home ? "home" : key.end ? "end" : null;
         if (arrow) {
           if (key.shift) {
-            if (!anchor) setAnchor({ row: doc.row, col: doc.col });
+            if (!anchorRef.current) {
+              const cur = docRef.current;
+              if (cur) setAnchor({ row: cur.row, col: cur.col });
+            }
           } else setAnchor(null);
-          setDoc(move(doc, arrow));
+          setDoc((prev) => (prev ? move(prev, arrow) : prev));
           return;
         }
         if (key.pageDown) {
@@ -685,7 +751,7 @@ function App(props: { api: SquadApi; session: Session; version: string }): React
           return;
         }
         if (key.ctrl || key.meta) return;
-        if (input) setDoc(insert(eatSel(), input));
+        if (text) setDoc((prev) => (prev ? typeInto(eatSelPrev(prev), text) : prev));
         return;
       }
 
@@ -730,13 +796,14 @@ function App(props: { api: SquadApi; session: Session; version: string }): React
     let failed = false;
     try {
       await suspendTty(async () => {
-        text = await composeInEditor(value);
+        text = await composeInEditor(draftRef.current);
       });
     } catch (err) {
       failed = true;
       push({ kind: "sys", text: err instanceof Error ? err.message : String(err) });
     }
-    setValue("");
+    setPromptTick((n) => n + 1);
+    draftRef.current = "";
     if (failed) return;
     if (text) await runJob(text);
     else push({ kind: "sys", text: "editor vacío o cancelado" });
@@ -837,7 +904,8 @@ function App(props: { api: SquadApi; session: Session; version: string }): React
 
   const onSubmit = async (raw: string): Promise<void> => {
     const line = raw.trim();
-    setValue("");
+    setPromptTick((n) => n + 1);
+    draftRef.current = "";
     if (!line || busy || quitAsk || uiMode === "editor") return;
     if (pending.length) {
       push({ kind: "sys", text: "primero y/n los cambios de la IA" });
@@ -892,20 +960,14 @@ function App(props: { api: SquadApi; session: Session; version: string }): React
 
   const health = session.health;
   const empty = lines.length === 0;
-  const split = uiMode !== "editor" && Boolean(openRel);
-  const maxChat = Math.max(3, split ? Math.floor((rows - 14) / 2) : rows - 10);
-  const fileVis = split ? Math.max(5, Math.floor((rows - 14) / 2)) : codeVis;
+  const maxChat = Math.max(3, reviewing ? 4 : split ? Math.floor((rows - 14) / 2) : rows - 10);
   const visible = lines.slice(-maxChat);
   const visibleSteps = steps.slice(-(Math.max(3, Math.floor((rows - 14) / 2))));
   const treeWindow = tree.slice(treeStart, treeStart + treeVis);
-  const reviewing = pending[reviewIdx] ?? null;
-  const diffRows = reviewing && openRel === reviewing.rel ? lineDiff(reviewing.before ?? "", reviewing.after) : null;
-  const viewLines = diffRows
-    ? diffRows.slice(previewOff, previewOff + fileVis)
-    : doc
-      ? doc.lines.slice(previewOff, previewOff + fileVis).map((t) => ({ k: " " as const, t }))
-      : [];
-  const previewTotal = diffRows ? diffRows.length : (doc?.lines.length ?? 0);
+  const viewLines = doc
+    ? doc.lines.slice(previewOff, previewOff + fileVis).map((t) => ({ k: " " as const, t }))
+    : [];
+  const previewTotal = reviewing ? splitRows.length : (doc?.lines.length ?? 0);
   const user = os.userInfo().username;
   const model = (session.config?.settings.workerModel ?? "—").slice(0, 16);
   const project = path.basename(session.workspaceDir);
@@ -959,7 +1021,7 @@ function App(props: { api: SquadApi; session: Session; version: string }): React
                 <Text dimColor>{uiMode === "chat" ? "un modelo" : "jefe / worker / QA"}</Text>
               </Box>
             ) : (
-              <Box flexGrow={1} flexDirection="column" overflow="hidden" backgroundColor={C.bg}>
+              <Box height={reviewing ? 5 : undefined} flexGrow={reviewing ? 0 : 1} flexDirection="column" overflow="hidden" backgroundColor={C.bg}>
                 {visible.map((line, i) => (
                   <Text key={`${i}-${line.kind}`} color={colorFor(line.kind)} wrap="wrap">
                     {line.kind === "user" ? "tú  " : line.kind === "squad" ? `${line.who ?? "squad"}  ` : "    "}
@@ -971,21 +1033,23 @@ function App(props: { api: SquadApi; session: Session; version: string }): React
           ) : null}
           {uiMode === "editor" || openRel ? (
             <Box flexGrow={1} flexDirection="column" overflow="hidden" backgroundColor={C.bg}>
-              <Text color={reviewing ? C.amber : C.cyan} wrap="truncate">
+              <Text color={C.cyan} wrap="truncate">
                 {reviewing
-                  ? `PENDIENTE ${reviewIdx + 1}/${pending.length}  ${openRel}  y acepta  n revierte`
+                  ? `${actionTitle(reviewing.action)} ${openRel}  ${reviewIdx + 1}/${pending.length}`
                   : openRel
                     ? `~/${project}/${openRel}${doc?.dirty ? " *" : ""}`
                     : "click o enter abre · escribí en el centro"}
               </Text>
-              <Box flexGrow={1} flexDirection="column" borderStyle="round" borderColor={reviewing ? C.amber : focus === "buf" ? C.cyan : C.muted} paddingX={1} marginTop={1} overflow="hidden" backgroundColor={C.panel}>
-                {viewLines.length === 0 ? (
+              <Box flexGrow={1} flexDirection="column" borderStyle="round" borderColor={reviewing ? C.cyan : focus === "buf" ? C.cyan : C.muted} paddingX={1} marginTop={1} overflow="hidden" backgroundColor={C.panel}>
+                {reviewing ? (
+                  <DiffView rows={splitRows} off={previewOff} vis={fileVis} file={reviewing.rel} width={Math.max(20, centerW - 6)} />
+                ) : viewLines.length === 0 ? (
                   <Text dimColor>j/k o click en el árbol</Text>
                 ) : (
                   viewLines.map((ln, i) => {
                     const text = ln.t;
                     const absRow = previewOff + i;
-                    const interactive = uiMode === "editor" && focus === "buf" && !diffRows;
+                    const interactive = uiMode === "editor" && focus === "buf";
                     const caretOn = Boolean(interactive && doc && absRow === doc.row);
                     const col = caretOn && doc ? Math.min(doc.col, text.length) : 0;
                     const ch = text[col] ?? " ";
@@ -998,12 +1062,14 @@ function App(props: { api: SquadApi; session: Session; version: string }): React
                         selTo = absRow === e.row ? e.col : text.length;
                       }
                     }
-                    const color = ln.k === "+" ? C.emerald : ln.k === "-" ? C.rose : tintLine(text);
-                    const mark = diffRows ? `${ln.k === " " ? " " : ln.k} ` : "";
+                    const color = tintLine(text);
+                    const segments = colorizeLine(text, langFromExt(openRel ?? ""));
+                    const hasSegments = segments.length > 0;
+
                     return (
                       <Text key={i} color={color} wrap="truncate">
                         <Text color={C.muted}>
-                          {String(absRow + 1).padStart(4, " ")} {mark}
+                          {String(absRow + 1).padStart(4, " ")}{" "}
                         </Text>
                         {selFrom !== null && selTo !== null ? (
                           <Text>
@@ -1012,13 +1078,43 @@ function App(props: { api: SquadApi; session: Session; version: string }): React
                             {text.slice(selTo)}
                           </Text>
                         ) : caretOn ? (
-                          <Text>
-                            {text.slice(0, col)}
-                            <Text inverse>{ch}</Text>
-                            {text.slice(col + 1)}
-                          </Text>
+                          hasSegments ? (
+                            <Text>
+                              {segments.map((seg, si) => {
+                                const segStart = segments.slice(0, si).reduce((acc, s) => acc + s.text.length, 0);
+                                const segEnd = segStart + seg.text.length;
+                                const isLast = si === segments.length - 1;
+                                if (col >= segStart && (col < segEnd || (isLast && col === segEnd))) {
+                                  const localCol = col - segStart;
+                                  const cursorCh = seg.text[localCol] ?? " ";
+                                  return (
+                                    <Text key={si} color={seg.color}>
+                                      {seg.text.slice(0, localCol)}
+                                      <Text inverse>{cursorCh}</Text>
+                                      {seg.text.slice(localCol + 1)}
+                                    </Text>
+                                  );
+                                }
+                                return <Text key={si} color={seg.color}>{seg.text}</Text>;
+                              })}
+                            </Text>
+                          ) : (
+                            <Text>
+                              {text.slice(0, col)}
+                              <Text inverse>{ch}</Text>
+                              {text.slice(col + 1)}
+                            </Text>
+                          )
                         ) : (
-                          text || " "
+                          hasSegments ? (
+                            <Text>
+                              {segments.map((seg, si) => (
+                                <Text key={si} color={seg.color}>{seg.text}</Text>
+                              ))}
+                            </Text>
+                          ) : (
+                            text || " "
+                          )
                         )}
                       </Text>
                     );
@@ -1028,7 +1124,7 @@ function App(props: { api: SquadApi; session: Session; version: string }): React
               {openRel ? (
                 <Text dimColor>
                   {reviewing
-                    ? "y este  n este  a todos  r todos"
+                    ? "y este  n este  a todos  r todos  j/k scroll"
                     : `${doc ? `${(doc.row ?? 0) + 1}:${(doc.col ?? 0) + 1}` : "—"} · ${previewOff + 1}–${previewOff + viewLines.length}/${previewTotal}`}
                 </Text>
               ) : null}
@@ -1081,38 +1177,19 @@ function App(props: { api: SquadApi; session: Session; version: string }): React
           </Box>
         </Box>
       ) : (
-        <Box paddingX={1} marginBottom={1} flexDirection="column" backgroundColor={C.bg}>
-          <Box borderStyle="round" borderColor={busy ? C.amber : accent} paddingX={1} backgroundColor={C.panel}>
-            <Text color={accent} bold>
-              {uiMode.toUpperCase()}
-            </Text>
-            {/* El modo vive en el prompt, no en una línea extra. */}
-            <Text color={accent}> ▌ </Text>
-            {away ? (
-              <Text dimColor>en $EDITOR — guardá y salí</Text>
-            ) : pending.length ? (
-              <Text color={C.amber}>y acepta · n revierte · a todos · r todos</Text>
-            ) : uiMode === "editor" ? (
-              <Text dimColor>
-                {focus === "buf"
-                  ? "arrastrá para sombrear · ctrl+c copia · ctrl+p pega"
-                  : "j/k árbol · enter/click abre · rueda · tab modo"}
-              </Text>
-            ) : connectMode ? (
-              <TextInput value={value} onChange={setValue} onSubmit={(v) => void onSubmit(v)} mask="*" placeholder="sk-…" />
-            ) : (
-              <TextInput
-                value={value}
-                onChange={(v) => setValue(v.replace(/\t/g, ""))}
-                onSubmit={(v) => void onSubmit(v)}
-                placeholder={busy ? "Ctrl+C cancela" : "Enter command…  /help"}
-              />
-            )}
-          </Box>
-          <Text dimColor>
-            {busy ? "ctrl+c cancela · ctrl+p proc" : "[TAB] Mode  [CTRL+P] Proc  [/help]  v" + version}
-          </Text>
-        </Box>
+        <PromptBar
+          draftRef={draftRef}
+          resetTick={promptTick}
+          onSubmit={(v) => void onSubmit(v)}
+          busy={busy}
+          uiMode={uiMode}
+          accent={accent}
+          away={away}
+          connectMode={connectMode}
+          pending={pending}
+          focus={focus}
+          version={version}
+        />
       )}
     </Box>
   );

@@ -147,12 +147,35 @@ export function insert(doc: Doc, text: string): Doc {
       continue;
     }
     const add = ch === "\t" ? "  " : ch;
-    if (ch !== "\t" && ch < " " && ch !== "\u00a0") continue;
+    // 0x7f es Backspace en Linux; no es texto. C0 (salvo tab/nl) tampoco.
+    if (ch !== "\t" && (ch < " " || ch === "\x7f")) continue;
     const line = lines[row] ?? "";
     lines[row] = line.slice(0, col) + add + line.slice(col);
     col += add.length;
   }
   return commit(doc, lines, row, col);
+}
+
+/** Un chunk de teclado: letras + 0x7f/0x08 mezclados (tipeo rápido en raw mode). */
+export function typeInto(doc: Doc, raw: string): Doc {
+  let d = doc;
+  let run = "";
+  const flush = (): void => {
+    if (!run) return;
+    d = insert(d, run);
+    run = "";
+  };
+  for (const ch of raw) {
+    const c = ch.charCodeAt(0);
+    if (c === 0x7f || c === 0x08) {
+      flush();
+      d = backspace(d);
+      continue;
+    }
+    run += ch;
+  }
+  flush();
+  return d;
 }
 
 export function newline(doc: Doc): Doc {
@@ -249,6 +272,36 @@ export function parseMouse(input: string): MouseEv | null {
   const m = /^\[?<(\d+);(\d+);(\d+)([Mm])$/.exec(s);
   if (!m) return null;
   return { btn: Number(m[1]), x: Number(m[2]), y: Number(m[3]), press: m[4] === "M" };
+}
+
+/**
+ * Un chunk de stdin puede traer mouse + teclas juntos. Si insertamos el CSI,
+ * el archivo se llena de `[<0;12;8M` y 0x7f.
+ */
+export function peelInput(raw: string): { events: MouseEv[]; text: string } {
+  const events: MouseEv[] = [];
+  let text = "";
+  let i = 0;
+  while (i < raw.length) {
+    const isEsc = raw.charCodeAt(i) === 0x1b;
+    const isBare = raw[i] === "[" && raw[i + 1] === "<";
+    if (isEsc || isBare) {
+      const start = isEsc ? i + 1 : i;
+      const m = /^\[<(\d+);(\d+);(\d+)([Mm])/.exec(raw.slice(start));
+      if (m) {
+        events.push({ btn: Number(m[1]), x: Number(m[2]), y: Number(m[3]), press: m[4] === "M" });
+        i = start + m[0].length;
+        continue;
+      }
+      if (isEsc) {
+        i += 1;
+        continue;
+      }
+    }
+    text += raw[i] ?? "";
+    i += 1;
+  }
+  return { events, text };
 }
 
 export function mouseKind(ev: MouseEv): "down" | "up" | "drag" | "wheel-up" | "wheel-down" | "ignore" {

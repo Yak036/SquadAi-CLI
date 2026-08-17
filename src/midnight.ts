@@ -15,6 +15,21 @@ export const C = {
   amber: "#fbbf24",
   rose: "#f87171",
   muted: "#7a8496",
+  /** Fondos de diff tipo OpenCode: rojo apagado / teal apagado. */
+  delBg: "#3b1d22",
+  addBg: "#163a3c",
+  /** Syntax highlighting */
+  synKeyword: "#c792ea",
+  synString: "#c3e88d",
+  synNumber: "#f78c6c",
+  synComment: "#546e7a",
+  synFunction: "#82aaff",
+  synType: "#ffcb6b",
+  synOperator: "#89ddff",
+  synProperty: "#f07178",
+  synBoolean: "#ff5370",
+  synDecorator: "#c792ea",
+  synText: "#d6deeb",
 } as const;
 
 /** #12141d en SGR 48 para el clear del alt-screen (BCE). */

@@ -1,4 +1,4 @@
-# SquadAi-CLI impresionante asdasd  asdasdasdasdasdasdasdasdasdasdasdasdasdasdasdasdadasdasdasdsaas
+# SquadAi-CLI impresionante
 
 REPL tipo OpenCode / Claude Code. Es el front del orquestador: hablas en la terminal y el CLI pega a **SquadAi-Back**.
 
